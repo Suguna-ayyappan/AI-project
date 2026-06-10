@@ -1,0 +1,968 @@
+#include <Wire.h>
+#include <ESP8266WiFi.h>
+#include <ESP8266WebServer.h>
+#include "MAX30100_PulseOximeter.h"
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+const char* ssid     = "iotlab";
+const char* password = "password";
+
+#define REPORTING_PERIOD_MS  1000
+#define OLED_PERIOD_MS       3000
+#define MAX_HISTORY          40
+
+// ── OLED: 128x64, I2C address 0x3C ───────────────────────────
+// SDA → D2 (GPIO4) | SCL → D1 (GPIO5)
+#define SCREEN_WIDTH  128
+#define SCREEN_HEIGHT  64
+#define OLED_RESET     -1
+#define OLED_ADDR      0x3C   // try 0x3D if blank
+
+Adafruit_SSD1306 oled(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+PulseOximeter    pox;
+ESP8266WebServer server(80);
+MAX30100         sensor;
+
+float    BPM  = 0, SpO2 = 0, TEMP = 0;
+uint32_t tsLastReport  = 0;
+uint32_t tsLastReading = 0;
+uint32_t tsLastOLED    = 0;
+int      oledScreen    = 0;   // 0=BPM 1=SpO2 2=Temp
+
+float    bpmHistory[MAX_HISTORY];
+float    spo2History[MAX_HISTORY];
+float    tempHistory[MAX_HISTORY];
+uint32_t timeHistory[MAX_HISTORY];
+int      historyIndex = 0, historyCount = 0;
+
+void onBeatDetected() {
+  Serial.println(">> Beat!");
+  // Flash heart on OLED briefly
+  oled.fillRect(100, 0, 28, 16, BLACK);
+  oled.setTextSize(1);
+  oled.setTextColor(WHITE);
+  oled.setCursor(100, 4);
+  oled.print("<3");
+  oled.display();
+}
+
+// ─────────────────────────────────────────────────────────────
+// OLED draw helpers
+// ─────────────────────────────────────────────────────────────
+
+// Draw a thick horizontal divider line
+void oledDivider(int y) {
+  oled.drawFastHLine(0, y, SCREEN_WIDTH, WHITE);
+}
+
+// Screen 0 — Heart Rate
+void oledShowBPM() {
+  oled.clearDisplay();
+  // Title bar
+  oled.fillRect(0, 0, 128, 14, WHITE);
+  oled.setTextColor(BLACK);
+  oled.setTextSize(1);
+  oled.setCursor(32, 3);
+  oled.print("HEART RATE");
+  // Value
+  oled.setTextColor(WHITE);
+  oled.setTextSize(3);
+  String val = BPM > 0 ? String((int)BPM) : "--";
+  int xOff = (BPM > 99) ? 14 : (BPM > 9 ? 26 : 44);
+  oled.setCursor(xOff, 20);
+  oled.print(val);
+  // Unit
+  oled.setTextSize(1);
+  oled.setCursor(100, 52);
+  oled.print("BPM");
+  // Bottom divider
+  oledDivider(50);
+  // Status dot
+  oled.fillCircle(6, 57, 4, WHITE);
+  oled.setCursor(14, 54);
+  oled.print(BPM > 110 ? "HIGH ALERT" : "Normal");
+  oled.display();
+}
+
+// Screen 1 — SpO2
+void oledShowSpO2() {
+  oled.clearDisplay();
+  oled.fillRect(0, 0, 128, 14, WHITE);
+  oled.setTextColor(BLACK);
+  oled.setTextSize(1);
+  oled.setCursor(40, 3);
+  oled.print("SpO2");
+  oled.setTextColor(WHITE);
+  oled.setTextSize(3);
+  String val = SpO2 > 0 ? String((int)SpO2) : "--";
+  int xOff = (SpO2 > 99) ? 14 : 26;
+  oled.setCursor(xOff, 20);
+  oled.print(val);
+  oled.setTextSize(1);
+  oled.setCursor(104, 20);
+  oled.print("%");
+  oledDivider(50);
+  oled.fillCircle(6, 57, 4, WHITE);
+  oled.setCursor(14, 54);
+  oled.print((SpO2 < 95 && SpO2 > 0) ? "LOW ALERT" : "Normal");
+  oled.display();
+}
+
+// Screen 2 — Temperature
+void oledShowTemp() {
+  oled.clearDisplay();
+  oled.fillRect(0, 0, 128, 14, WHITE);
+  oled.setTextColor(BLACK);
+  oled.setTextSize(1);
+  oled.setCursor(24, 3);
+  oled.print("TEMPERATURE");
+  oled.setTextColor(WHITE);
+  oled.setTextSize(3);
+  String val = TEMP > 0 ? String(TEMP, 1) : "--";
+  oled.setCursor(10, 20);
+  oled.print(val);
+  oled.setTextSize(1);
+  oled.setCursor(110, 20);
+  oled.print("C");
+  oledDivider(50);
+  oled.fillCircle(6, 57, 4, WHITE);
+  oled.setCursor(14, 54);
+  oled.print((TEMP > 38 && TEMP > 0) ? "HIGH ALERT" : "Normal");
+  oled.display();
+}
+
+// Alert screen — overrides normal rotation
+void oledShowAlert(String line1, String line2) {
+  oled.clearDisplay();
+  // Flashing border
+  oled.drawRect(0, 0, 128, 64, WHITE);
+  oled.drawRect(2, 2, 124, 60, WHITE);
+  // Alert icon
+  oled.setTextSize(2);
+  oled.setTextColor(WHITE);
+  oled.setCursor(56, 6);
+  oled.print("!");
+  oledDivider(26);
+  oled.setTextSize(1);
+  oled.setCursor(2, 30);
+  oled.print(line1);
+  oled.setCursor(2, 44);
+  oled.print(line2);
+  oled.display();
+}
+
+// Called every OLED_PERIOD_MS
+void updateOLED() {
+  bool bpmWarn  = BPM  > 110;
+  bool spo2Warn = SpO2 < 95 && SpO2 > 0;
+  bool tempWarn = TEMP > 38  && TEMP > 0;
+
+  if (bpmWarn || spo2Warn || tempWarn) {
+    String l1 = "*** ALERT ***";
+    String l2 = "";
+    if      (bpmWarn)  l2 = "High BPM: " + String((int)BPM);
+    else if (spo2Warn) l2 = "Low SpO2: " + String((int)SpO2) + "%";
+    else if (tempWarn) l2 = "Hi Temp:  " + String(TEMP, 1) + "C";
+    oledShowAlert(l1, l2);
+    return;
+  }
+
+  switch (oledScreen % 3) {
+    case 0: oledShowBPM();  break;
+    case 1: oledShowSpO2(); break;
+    case 2: oledShowTemp(); break;
+  }
+  oledScreen++;
+}
+
+// Startup splash screen
+void oledSplash(String l1, String l2) {
+  oled.clearDisplay();
+  oled.setTextColor(WHITE);
+  oled.setTextSize(1);
+  oled.setCursor(0, 10);
+  oled.println(l1);
+  oled.setCursor(0, 30);
+  oled.println(l2);
+  oled.display();
+}
+
+// ─────────────────────────────────────────────────────────────
+// Sensor history
+// ─────────────────────────────────────────────────────────────
+void pushHistory(float b, float s, float t) {
+  bpmHistory[historyIndex]  = b;
+  spo2History[historyIndex] = s;
+  tempHistory[historyIndex] = t;
+  timeHistory[historyIndex] = millis() / 1000;
+  historyIndex = (historyIndex + 1) % MAX_HISTORY;
+  if (historyCount < MAX_HISTORY) historyCount++;
+}
+
+// ─────────────────────────────────────────────────────────────
+// HTTP endpoints
+// ─────────────────────────────────────────────────────────────
+void handleHistory() {
+  String json = "[";
+  int start = (historyCount < MAX_HISTORY) ? 0 : historyIndex;
+  for (int i = 0; i < historyCount; i++) {
+    int idx = (start + i) % MAX_HISTORY;
+    if (i > 0) json += ",";
+    json += "{\"bpm\":"  + String(bpmHistory[idx],  1) + ",";
+    json += "\"spo2\":" + String(spo2History[idx], 1) + ",";
+    json += "\"temp\":" + String(tempHistory[idx], 2) + ",";
+    json += "\"ts\":"   + String(timeHistory[idx])    + "}";
+  }
+  json += "]";
+  server.send(200, "application/json", json);
+}
+
+void handleData() {
+  String json = "{\"bpm\":"  + String(BPM,  1) + ",";
+  json        += "\"spo2\":" + String(SpO2, 1) + ",";
+  json        += "\"temp\":" + String(TEMP, 2) + ",";
+  json        += "\"ts\":"   + String(millis() / 1000) + "}";
+  server.send(200, "application/json", json);
+}
+
+void handleManifest() {
+  String m = "{\"name\":\"Pulse Oximeter\",";
+  m += "\"short_name\":\"PulseOx\",";
+  m += "\"start_url\":\"/\",\"display\":\"standalone\",";
+  m += "\"background_color\":\"#0f172a\",\"theme_color\":\"#ef4444\",";
+  m += "\"orientation\":\"portrait\",";
+  m += "\"icons\":[{\"src\":\"/icon\",\"sizes\":\"192x192\",\"type\":\"image/svg+xml\"}]}";
+  server.send(200, "application/manifest+json", m);
+}
+
+void handleIcon() {
+  String svg = "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 192 192'>";
+  svg += "<rect width='192' height='192' rx='40' fill='#0f172a'/>";
+  svg += "<text x='96' y='130' font-size='110' text-anchor='middle' fill='#ef4444'>&#10084;</text>";
+  svg += "</svg>";
+  server.send(200, "image/svg+xml", svg);
+}
+
+void handle404() { server.send(404, "text/plain", "Not found"); }
+
+// ═════════════════════════════════════════════════════════════
+// HTML_P1
+// ═════════════════════════════════════════════════════════════
+const char HTML_P1[] PROGMEM = R"===(
+<!DOCTYPE html>
+<html lang='en'>
+<head>
+<meta charset='UTF-8'>
+<meta name='viewport' content='width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no'>
+<meta name='theme-color' content='#0f172a'>
+<meta name='apple-mobile-web-app-capable' content='yes'>
+<meta name='apple-mobile-web-app-status-bar-style' content='black-translucent'>
+<meta name='apple-mobile-web-app-title' content='PulseOx'>
+<link rel='manifest' href='/manifest.json'>
+<title>Pulse Oximeter</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+:root{--bg:#0f172a;--bg2:#1e293b;--bg3:#334155;
+  --red:#ef4444;--blue:#3b82f6;--amber:#f59e0b;--green:#22c55e;
+  --text:#e2e8f0;--muted:#64748b;--hint:#94a3b8}
+html,body{height:100%;background:var(--bg);color:var(--text);
+  font-family:'Segoe UI',system-ui,-apple-system,sans-serif;overflow:hidden}
+.app{display:flex;flex-direction:column;height:100vh;height:100dvh;
+     max-width:480px;margin:0 auto}
+.hdr{padding:12px 16px 10px;background:var(--bg);
+     display:flex;justify-content:space-between;align-items:center;
+     border-bottom:1px solid var(--bg3);flex-shrink:0}
+.hdr-title{font-size:1rem;font-weight:700;color:var(--text);
+           display:flex;align-items:center;gap:8px}
+.beat{display:inline-block;animation:hb .85s ease-in-out infinite;color:var(--red)}
+@keyframes hb{0%,100%{transform:scale(1)}50%{transform:scale(1.3)}}
+.hdr-right{display:flex;flex-direction:column;align-items:flex-end;gap:2px}
+.status{display:flex;align-items:center;gap:5px;font-size:.62rem;color:var(--muted)}
+.dot-live{width:6px;height:6px;border-radius:50%;background:var(--green);
+          animation:bl 1.5s ease-in-out infinite}
+@keyframes bl{0%,100%{opacity:1}50%{opacity:.3}}
+.reading-count{font-size:.58rem;color:var(--muted)}
+.oled-chip{display:inline-flex;align-items:center;gap:4px;
+           background:#1e293b;border:1px solid #334155;border-radius:6px;
+           padding:2px 7px;font-size:.55rem;color:#818cf8;margin-top:2px}
+.oled-chip::before{content:'';width:5px;height:5px;border-radius:50%;
+                   background:#818cf8;display:inline-block}
+.pages{flex:1;overflow-y:auto;overflow-x:hidden;-webkit-overflow-scrolling:touch}
+.page{display:none;padding:12px 12px 16px}
+.page.active{display:block}
+.alrt{background:#450a0a;border:1px solid var(--red);border-radius:10px;
+      padding:9px 14px;margin-bottom:10px;font-size:.75rem;
+      color:#fca5a5;text-align:center;display:none;
+      animation:flash 1.2s ease-in-out infinite}
+@keyframes flash{0%,100%{border-color:var(--red)}50%{border-color:#7f1d1d}}
+.cards{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-bottom:10px}
+.card{background:var(--bg2);border-radius:12px;padding:10px 6px;
+      text-align:center;position:relative;overflow:hidden}
+.card::before{content:'';position:absolute;top:0;left:0;right:0;
+              height:3px;border-radius:12px 12px 0 0}
+.card.bpm::before{background:var(--red)}
+.card.spo::before{background:var(--blue)}
+.card.tmp::before{background:var(--amber)}
+.c-icon{font-size:1rem;margin-bottom:3px}
+.c-lbl{font-size:.5rem;color:var(--muted);text-transform:uppercase;
+       letter-spacing:.8px;margin-bottom:3px}
+.c-val{font-size:1.6rem;font-weight:700;line-height:1}
+.c-unit{font-size:.52rem;color:var(--hint);margin-top:2px}
+.bpm .c-val{color:var(--red)}.spo .c-val{color:var(--blue)}.tmp .c-val{color:var(--amber)}
+.chart-row{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-bottom:8px}
+.chart-block{background:var(--bg2);border-radius:12px;padding:10px 10px 8px}
+.chart-hdr{display:flex;justify-content:space-between;
+           align-items:center;margin-bottom:7px}
+.chart-lbl{font-size:.55rem;color:var(--hint);
+           text-transform:uppercase;letter-spacing:.4px}
+.chart-cur{font-size:.65rem;font-weight:700}
+canvas{width:100%!important;display:block}
+.sbar{background:var(--bg2);border-radius:10px;padding:7px 12px;margin-top:2px;
+      display:flex;justify-content:space-between;font-size:.62rem;color:var(--muted)}
+
+/* OLED simulator */
+.oled-card{background:#0a0a0a;border-radius:12px;padding:14px;
+           margin-top:8px;border:2px solid #818cf8;position:relative}
+.oled-card-title{font-size:.6rem;color:#818cf8;text-transform:uppercase;
+                 letter-spacing:.5px;font-weight:600;margin-bottom:10px;
+                 display:flex;align-items:center;gap:5px}
+.oled-card-title::before{content:'';width:6px;height:6px;border-radius:50%;
+                         background:#818cf8;display:inline-block;
+                         animation:bl 1.5s ease-in-out infinite}
+/* 128x64 pixel OLED simulation */
+.oled-screen{background:#000;border-radius:6px;
+             width:128px;height:64px;
+             margin:0 auto;position:relative;
+             border:1px solid #222;overflow:hidden}
+.oled-canvas-wrap{width:128px;height:64px;
+                  transform-origin:top left;margin:0 auto}
+canvas#oled-sim{display:block;image-rendering:pixelated;
+                width:128px;height:64px}
+.oled-meta{display:flex;justify-content:space-between;
+           margin-top:8px;font-size:.58rem;color:var(--muted)}
+.oled-scale-wrap{display:flex;justify-content:center;margin:0 auto}
+
+/* Log table */
+.tbl-hdr{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px}
+.tbl-title{font-size:.7rem;font-weight:600;color:var(--hint);
+           text-transform:uppercase;letter-spacing:.5px}
+.tbl-count{font-size:.62rem;color:var(--muted)}
+.tbl-scroll{overflow-x:auto;-webkit-overflow-scrolling:touch;border-radius:10px}
+table{width:100%;border-collapse:collapse;font-size:.72rem;min-width:320px}
+thead{background:var(--bg2)}
+th{padding:8px 10px;text-align:left;font-size:.58rem;color:var(--muted);
+   text-transform:uppercase;letter-spacing:.5px;font-weight:600;
+   border-bottom:1px solid var(--bg3)}
+td{padding:7px 10px;border-bottom:1px solid rgba(255,255,255,.04);color:#cbd5e1}
+tbody tr:hover{background:var(--bg2)}
+.pill{display:inline-block;padding:2px 7px;border-radius:99px;
+      font-size:.65rem;font-weight:600}
+.p-b{background:#ef444418;color:var(--red)}
+.p-s{background:#3b82f618;color:var(--blue)}
+.p-t{background:#f59e0b18;color:var(--amber)}
+.warn{background:#ef444430!important;color:#fca5a5!important}
+
+/* Save page */
+.save-section{background:var(--bg2);border-radius:14px;padding:16px;margin-bottom:12px}
+.save-title{font-size:.65rem;color:var(--hint);text-transform:uppercase;
+            letter-spacing:.5px;font-weight:600;margin-bottom:12px}
+.save-row{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:10px}
+.btn-dl{display:flex;flex-direction:column;align-items:center;gap:6px;
+        padding:16px;border-radius:12px;border:none;cursor:pointer;
+        font-size:.78rem;font-weight:600;transition:opacity .15s}
+.btn-dl:active{opacity:.75}
+.btn-dl svg{width:22px;height:22px}
+.btn-csv{background:#14532d;color:#4ade80}
+.btn-json{background:#1e3a5f;color:#60a5fa}
+.save-info{font-size:.65rem;color:var(--muted);text-align:center;margin-top:4px}
+.install-steps{font-size:.72rem;color:var(--muted);line-height:2;margin-top:10px}
+.install-steps span{display:block}
+.install-steps b{color:var(--text)}
+.ip-chip{background:var(--bg3);border-radius:8px;padding:8px 14px;
+         font-family:monospace;font-size:.9rem;color:var(--text);
+         display:inline-block;margin:8px 0;letter-spacing:.5px}
+
+/* Tabs */
+.tabs{display:flex;background:var(--bg2);border-top:1px solid var(--bg3);
+      padding-bottom:env(safe-area-inset-bottom);flex-shrink:0}
+.tab{flex:1;display:flex;flex-direction:column;align-items:center;
+     gap:3px;padding:10px 4px;font-size:.6rem;color:var(--muted);
+     cursor:pointer;transition:color .15s;border:none;background:none}
+.tab.active{color:var(--red)}
+.tab svg{width:20px;height:20px}
+.toast{position:fixed;bottom:80px;left:50%;
+       transform:translateX(-50%) translateY(12px);
+       background:var(--bg2);border:1px solid var(--bg3);
+       border-radius:10px;padding:10px 20px;font-size:.78rem;
+       color:var(--hint);opacity:0;transition:opacity .3s,transform .3s;
+       pointer-events:none;z-index:999;white-space:nowrap}
+.toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
+.toast.ok{border-color:#16a34a60;color:#4ade80}
+@media(max-width:380px){.chart-row{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<div class='app'>
+  <div class='hdr'>
+    <div class='hdr-title'><span class='beat'>&#10084;</span> Pulse Oximeter</div>
+    <div class='hdr-right'>
+      <div class='status'><div class='dot-live'></div><span id='stxt'>Connecting...</span></div>
+      <span class='reading-count' id='ctxt'>0 readings</span>
+      <span class='oled-chip'>OLED 128x64</span>
+    </div>
+  </div>
+
+  <div class='pages'>
+
+    <!-- PAGE 0: Live -->
+    <div class='page active' id='pg-live'>
+      <div class='alrt' id='alrt'></div>
+      <div class='cards'>
+        <div class='card bpm'>
+          <div class='c-icon'>&#10084;</div>
+          <div class='c-lbl'>Heart Rate</div>
+          <div class='c-val' id='v-bpm'>--</div>
+          <div class='c-unit'>BPM</div>
+        </div>
+        <div class='card spo'>
+          <div class='c-icon'>&#128164;</div>
+          <div class='c-lbl'>SpO2</div>
+          <div class='c-val' id='v-spo2'>--</div>
+          <div class='c-unit'>%</div>
+        </div>
+        <div class='card tmp'>
+          <div class='c-icon'>&#127777;</div>
+          <div class='c-lbl'>Temp</div>
+          <div class='c-val' id='v-temp'>--</div>
+          <div class='c-unit'>&#176;C</div>
+        </div>
+      </div>
+
+      <!-- 3 charts in one row -->
+      <div class='chart-row'>
+        <div class='chart-block'>
+          <div class='chart-hdr'>
+            <span class='chart-lbl'>BPM</span>
+            <span class='chart-cur' style='color:#ef4444' id='l-bpm'>--</span>
+          </div>
+          <canvas id='c-bpm' height='100'></canvas>
+        </div>
+        <div class='chart-block'>
+          <div class='chart-hdr'>
+            <span class='chart-lbl'>SpO2</span>
+            <span class='chart-cur' style='color:#3b82f6' id='l-spo2'>--</span>
+          </div>
+          <canvas id='c-spo2' height='100'></canvas>
+        </div>
+        <div class='chart-block'>
+          <div class='chart-hdr'>
+            <span class='chart-lbl'>Temp</span>
+            <span class='chart-cur' style='color:#f59e0b' id='l-temp'>--</span>
+          </div>
+          <canvas id='c-temp' height='100'></canvas>
+        </div>
+      </div>
+
+      <div class='sbar'>
+        <span id='upd'>Updated: --</span>
+        <span id='ts-last'>--:--:--</span>
+      </div>
+
+      <!-- OLED simulator -->
+      <div class='oled-card'>
+        <div class='oled-card-title'>OLED Display Simulation (128x64)</div>
+        <div class='oled-scale-wrap'>
+          <canvas id='oled-sim' width='128' height='64'
+                  style='width:256px;height:128px;
+                         image-rendering:pixelated;
+                         border:1px solid #333;border-radius:4px;
+                         background:#000'></canvas>
+        </div>
+        <div class='oled-meta'>
+          <span id='oled-screen-lbl'>Screen: --</span>
+          <span>SSD1306 &middot; 0x3C &middot; Rotates 3s</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- PAGE 1: Log -->
+    <div class='page' id='pg-log'>
+      <div class='tbl-hdr'>
+        <span class='tbl-title'>&#128203; Reading Log</span>
+        <span class='tbl-count' id='tbl-count'>0 readings</span>
+      </div>
+      <div class='tbl-scroll'>
+        <table>
+          <thead>
+            <tr><th>#</th><th>Time</th><th>BPM</th>
+                <th>SpO2</th><th>Temp</th><th>Status</th></tr>
+          </thead>
+          <tbody id='data-table'></tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- PAGE 2: Save -->
+    <div class='page' id='pg-save'>
+      <div class='save-section'>
+        <div class='save-title'>&#128190; Download Data</div>
+        <div class='save-row'>
+          <button class='btn-dl btn-csv' onclick='saveCSV()'>
+            <svg viewBox='0 0 24 24' fill='none' stroke='currentColor'
+                 stroke-width='2' stroke-linecap='round' stroke-linejoin='round'>
+              <path d='M12 3v12M8 11l4 4 4-4M3 18h18'/>
+            </svg>CSV
+          </button>
+          <button class='btn-dl btn-json' onclick='saveJSON()'>
+            <svg viewBox='0 0 24 24' fill='none' stroke='currentColor'
+                 stroke-width='2' stroke-linecap='round' stroke-linejoin='round'>
+              <path d='M12 3v12M8 11l4 4 4-4M3 18h18'/>
+            </svg>JSON
+          </button>
+        </div>
+        <div class='save-info' id='save-info'>No data yet</div>
+      </div>
+      <div class='save-section'>
+        <div class='save-title'>&#128241; Install as App</div>
+        <div style='font-size:.72rem;color:var(--muted)'>Open in phone browser:</div>
+        <div class='ip-chip' id='ip-chip'>loading...</div>
+        <div class='install-steps'>
+          <span><b>Android Chrome:</b> tap &#8942; &rarr; Add to Home Screen</span>
+          <span><b>iPhone Safari:</b> tap Share &rarr; Add to Home Screen</span>
+        </div>
+      </div>
+    </div>
+
+  </div><!-- /pages -->
+
+  <nav class='tabs'>
+    <button class='tab active' id='tab-live' onclick='goTab(0)'>
+      <svg viewBox='0 0 24 24' fill='none' stroke='currentColor'
+           stroke-width='2' stroke-linecap='round' stroke-linejoin='round'>
+        <polyline points='22 12 18 12 15 21 9 3 6 12 2 12'/>
+      </svg>Live
+    </button>
+    <button class='tab' id='tab-log' onclick='goTab(1)'>
+      <svg viewBox='0 0 24 24' fill='none' stroke='currentColor'
+           stroke-width='2' stroke-linecap='round' stroke-linejoin='round'>
+        <path d='M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2'/>
+        <rect x='9' y='3' width='6' height='4' rx='1'/>
+        <line x1='9' y1='12' x2='15' y2='12'/>
+        <line x1='9' y1='16' x2='13' y2='16'/>
+      </svg>Log
+    </button>
+    <button class='tab' id='tab-save' onclick='goTab(2)'>
+      <svg viewBox='0 0 24 24' fill='none' stroke='currentColor'
+           stroke-width='2' stroke-linecap='round' stroke-linejoin='round'>
+        <path d='M19 21H5a2 2 0 01-2-2V5a2 2 0 012-2h11l5 5v11a2 2 0 01-2 2z'/>
+        <polyline points='17 21 17 13 7 13 7 21'/>
+        <polyline points='7 3 7 8 15 8'/>
+      </svg>Save
+    </button>
+  </nav>
+</div>
+<div class='toast' id='toast'></div>
+)===";
+
+// ═════════════════════════════════════════════════════════════
+// HTML_P2 — JavaScript
+// ═════════════════════════════════════════════════════════════
+const char HTML_P2[] PROGMEM = R"===(
+<script src='https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js'></script>
+<script>
+// ── Tab nav ───────────────────────────────────────────────────
+var tabIds=['tab-live','tab-log','tab-save'];
+var pgIds =['pg-live', 'pg-log', 'pg-save'];
+function goTab(n){
+  tabIds.forEach(function(t,i){
+    document.getElementById(t).classList.toggle('active',i===n);
+    document.getElementById(pgIds[i]).classList.toggle('active',i===n);
+  });
+  document.querySelector('.pages').scrollTop=0;
+}
+
+// ── Charts ────────────────────────────────────────────────────
+function mkC(id,color,yMin,yMax){
+  return new Chart(document.getElementById(id),{
+    type:'line',
+    data:{labels:[],datasets:[{data:[],borderColor:color,
+      backgroundColor:color+'18',borderWidth:1.8,
+      pointRadius:1.5,pointBackgroundColor:color,tension:0.4,fill:true}]},
+    options:{animation:false,responsive:true,maintainAspectRatio:true,
+      plugins:{legend:{display:false},
+        tooltip:{backgroundColor:'#1e293b',borderColor:'#334155',
+          borderWidth:1,titleColor:'#94a3b8',bodyColor:'#f8fafc',
+          padding:5,displayColors:false}},
+      scales:{
+        x:{ticks:{color:'#475569',font:{size:7},maxTicksLimit:4,maxRotation:0},
+           grid:{color:'#ffffff06'}},
+        y:{min:yMin,max:yMax,
+           ticks:{color:'#475569',font:{size:7},maxTicksLimit:4},
+           grid:{color:'#334155'}}
+      }
+    }
+  });
+}
+var cB=mkC('c-bpm', '#ef4444',40,160);
+var cS=mkC('c-spo2','#3b82f6',85,100);
+var cT=mkC('c-temp','#f59e0b',30,42);
+
+function apt(ch,lbl,val){
+  ch.data.labels.push(lbl);
+  ch.data.datasets[0].data.push(val);
+  if(ch.data.labels.length>40){ch.data.labels.shift();ch.data.datasets[0].data.shift();}
+  ch.update('none');
+}
+
+// ── OLED Canvas Simulator ─────────────────────────────────────
+var oledCtx=document.getElementById('oled-sim').getContext('2d');
+var oledStep=0;
+var oB=0,oS=0,oT=0;
+
+function oledClear(){oledCtx.fillStyle='#000';oledCtx.fillRect(0,0,128,64);}
+function oledRect(x,y,w,h,col){
+  oledCtx.fillStyle=col||'#fff';oledCtx.fillRect(x,y,w,h);
+}
+function oledText(txt,x,y,size,col){
+  oledCtx.fillStyle=col||'#fff';
+  oledCtx.font='bold '+(size*6)+'px monospace';
+  oledCtx.fillText(txt,x,y);
+}
+function oledLine(x1,y1,x2,y2){
+  oledCtx.strokeStyle='#fff';oledCtx.lineWidth=1;
+  oledCtx.beginPath();oledCtx.moveTo(x1,y1);oledCtx.lineTo(x2,y2);oledCtx.stroke();
+}
+
+function drawOledBPM(){
+  oledClear();
+  oledRect(0,0,128,13,'#fff');
+  oledText('HEART RATE',4,10,1,'#000');
+  var val=oB>0?Math.round(oB).toString():'--';
+  oledCtx.fillStyle='#fff';
+  oledCtx.font='bold 28px monospace';
+  oledCtx.fillText(val,10,50);
+  oledText('BPM',98,58,1,'#fff');
+  oledLine(0,52,128,52);
+  oledCtx.beginPath();oledCtx.arc(5,58,3,0,Math.PI*2);
+  oledCtx.fillStyle='#fff';oledCtx.fill();
+  oledText(oB>110?'HIGH!':'Normal',12,62,1,'#fff');
+}
+function drawOledSpO2(){
+  oledClear();
+  oledRect(0,0,128,13,'#fff');
+  oledText('SpO2',40,10,1,'#000');
+  var val=oS>0?Math.round(oS).toString():'--';
+  oledCtx.fillStyle='#fff';
+  oledCtx.font='bold 28px monospace';
+  oledCtx.fillText(val,10,50);
+  oledText('%',85,35,1,'#fff');
+  oledLine(0,52,128,52);
+  oledCtx.beginPath();oledCtx.arc(5,58,3,0,Math.PI*2);
+  oledCtx.fillStyle='#fff';oledCtx.fill();
+  oledText((oS<95&&oS>0)?'LOW!':'Normal',12,62,1,'#fff');
+}
+function drawOledTemp(){
+  oledClear();
+  oledRect(0,0,128,13,'#fff');
+  oledText('TEMPERATURE',2,10,1,'#000');
+  var val=oT>0?oT.toFixed(1):'--';
+  oledCtx.fillStyle='#fff';
+  oledCtx.font='bold 24px monospace';
+  oledCtx.fillText(val,4,48);
+  oledText('C',108,32,1,'#fff');
+  oledLine(0,52,128,52);
+  oledCtx.beginPath();oledCtx.arc(5,58,3,0,Math.PI*2);
+  oledCtx.fillStyle='#fff';oledCtx.fill();
+  oledText((oT>38&&oT>0)?'HIGH!':'Normal',12,62,1,'#fff');
+}
+function drawOledAlert(){
+  oledClear();
+  oledCtx.strokeStyle='#fff';oledCtx.lineWidth=1;
+  oledCtx.strokeRect(0,0,128,64);
+  oledCtx.strokeRect(2,2,124,60);
+  oledCtx.fillStyle='#fff';
+  oledCtx.font='bold 18px monospace';
+  oledCtx.fillText('!',58,22);
+  oledLine(0,28,128,28);
+  oledCtx.font='bold 8px monospace';
+  oledCtx.fillText('*** ALERT ***',10,40);
+  var msg='';
+  if(oB>110)           msg='High BPM: '+Math.round(oB);
+  else if(oS<95&&oS>0) msg='Low SpO2: '+Math.round(oS)+'%';
+  else if(oT>38&&oT>0) msg='Hi Temp: '+oT.toFixed(1)+'C';
+  oledCtx.fillText(msg,10,54);
+}
+
+function refreshOLED(){
+  var bW=oB>110,sW=oS<95&&oS>0,tW=oT>38&&oT>0;
+  var lbl='';
+  if(bW||sW||tW){drawOledAlert();lbl='Alert';}
+  else{
+    switch(oledStep%3){
+      case 0:drawOledBPM(); lbl='BPM (1/3)';break;
+      case 1:drawOledSpO2();lbl='SpO2 (2/3)';break;
+      case 2:drawOledTemp();lbl='Temp (3/3)';break;
+    }
+    oledStep++;
+  }
+  document.getElementById('oled-screen-lbl').textContent='Screen: '+lbl;
+}
+setInterval(refreshOLED,3000);
+
+// ── Table ─────────────────────────────────────────────────────
+var tableRows=[];
+function fmtTime(sec){
+  var d=new Date(sec*1000);
+  return d.getUTCHours().toString().padStart(2,'0')+':'+
+         d.getUTCMinutes().toString().padStart(2,'0')+':'+
+         d.getUTCSeconds().toString().padStart(2,'0');
+}
+function stLabel(bW,sW,tW){
+  if(!bW&&!sW&&!tW)
+    return '<span style="color:#22c55e;font-size:.65rem">&#10003; Normal</span>';
+  var w=[];
+  if(bW)w.push('BPM');if(sW)w.push('SpO2');if(tW)w.push('Temp');
+  return '<span style="color:#fca5a5;font-size:.65rem">&#9888; '+w.join(', ')+'</span>';
+}
+function addRow(bpm,spo2,temp,ts){
+  var bW=bpm>110,sW=spo2<95&&spo2>0,tW=temp>38&&temp>0;
+  tableRows.unshift({bpm:bpm,spo2:spo2,temp:temp,ts:ts,bW:bW,sW:sW,tW:tW});
+  if(tableRows.length>40)tableRows.pop();
+  renderTable();
+  document.getElementById('save-info').textContent=
+    tableRows.length+' readings ready to save';
+}
+function renderTable(){
+  var tb=document.getElementById('data-table');
+  tb.innerHTML='';
+  tableRows.forEach(function(d,i){
+    var tr=document.createElement('tr');
+    tr.innerHTML=
+      '<td style="color:#475569">'+(tableRows.length-i)+'</td>'+
+      '<td style="font-family:monospace;font-size:.65rem;color:#64748b">'+fmtTime(d.ts)+'</td>'+
+      '<td><span class="pill p-b'+(d.bW?' warn':'')+'">'+
+        (d.bpm >0?Math.round(d.bpm) :'--')+'</span></td>'+
+      '<td><span class="pill p-s'+(d.sW?' warn':'')+'">'+
+        (d.spo2>0?Math.round(d.spo2)+'%':'--')+'</span></td>'+
+      '<td><span class="pill p-t'+(d.tW?' warn':'')+'">'+
+        (d.temp>0?d.temp.toFixed(1):'--')+'</span></td>'+
+      '<td>'+stLabel(d.bW,d.sW,d.tW)+'</td>';
+    tb.appendChild(tr);
+  });
+  document.getElementById('tbl-count').textContent=tableRows.length+' readings';
+}
+
+// ── Toast ─────────────────────────────────────────────────────
+function toast(msg,ok){
+  var t=document.getElementById('toast');
+  t.textContent=msg;t.className='toast'+(ok?' ok':'');
+  void t.offsetWidth;t.classList.add('show');
+  setTimeout(function(){t.classList.remove('show');},2500);
+}
+
+// ── Save ──────────────────────────────────────────────────────
+function dlFile(c,n,m){
+  var a=document.createElement('a');
+  a.href=URL.createObjectURL(new Blob([c],{type:m}));
+  a.download=n;document.body.appendChild(a);a.click();document.body.removeChild(a);
+}
+function stamp(){
+  var d=new Date();
+  return d.getFullYear()+('0'+(d.getMonth()+1)).slice(-2)+
+    ('0'+d.getDate()).slice(-2)+'_'+
+    ('0'+d.getHours()).slice(-2)+('0'+d.getMinutes()).slice(-2);
+}
+function saveCSV(){
+  if(!tableRows.length){toast('No data');return;}
+  var lines=['#,Time,BPM,SpO2(%),Temp(C),Status'];
+  [].concat(tableRows).reverse().forEach(function(d,i){
+    lines.push([i+1,fmtTime(d.ts),
+      d.bpm >0?d.bpm.toFixed(1) :'',
+      d.spo2>0?d.spo2.toFixed(1):'',
+      d.temp>0?d.temp.toFixed(2):'',
+      (d.bW||d.sW||d.tW)?'Warning':'Normal'].join(','));
+  });
+  dlFile(lines.join('\r\n'),'pulse_'+stamp()+'.csv','text/csv');
+  toast('CSV saved ('+tableRows.length+' rows)',true);
+}
+function saveJSON(){
+  if(!tableRows.length){toast('No data');return;}
+  var out=[].concat(tableRows).reverse().map(function(d,i){
+    return{row:i+1,time:fmtTime(d.ts),
+      bpm:   d.bpm >0?+d.bpm.toFixed(1) :null,
+      spo2:  d.spo2>0?+d.spo2.toFixed(1):null,
+      temp_c:d.temp>0?+d.temp.toFixed(2):null,
+      status:(d.bW||d.sW||d.tW)?'warning':'normal'};
+  });
+  dlFile(JSON.stringify({device:'MAX30100+SSD1306',readings:out},null,2),
+    'pulse_'+stamp()+'.json','application/json');
+  toast('JSON saved ('+tableRows.length+' rows)',true);
+}
+
+// ── IP chip ───────────────────────────────────────────────────
+document.getElementById('ip-chip').textContent=location.hostname;
+
+// ── History load ──────────────────────────────────────────────
+function loadHist(){
+  fetch('/history').then(function(r){return r.json();}).then(function(arr){
+    [cB,cS,cT].forEach(function(c){c.data.labels=[];c.data.datasets[0].data=[];});
+    tableRows=[];
+    arr.forEach(function(d,i){
+      var l='#'+(i+1);
+      if(d.bpm >0)apt(cB,l,d.bpm);
+      if(d.spo2>0)apt(cS,l,d.spo2);
+      if(d.temp>0)apt(cT,l,d.temp);
+      addRow(d.bpm,d.spo2,d.temp,d.ts);
+    });
+    if(arr.length>0){
+      var last=arr[arr.length-1];
+      oB=last.bpm;oS=last.spo2;oT=last.temp;
+      refreshOLED();
+    }
+  }).catch(function(){});
+}
+
+// ── Poll ──────────────────────────────────────────────────────
+var rn=0;
+function poll(){
+  fetch('/data').then(function(r){return r.json();}).then(function(d){
+    rn++;var lbl='#'+rn;var now=new Date().toLocaleTimeString();
+    document.getElementById('v-bpm').textContent =d.bpm >0?Math.round(d.bpm) :'--';
+    document.getElementById('v-spo2').textContent=d.spo2>0?Math.round(d.spo2):'--';
+    document.getElementById('v-temp').textContent=d.temp>0?d.temp.toFixed(1)  :'--';
+    document.getElementById('l-bpm').textContent =d.bpm >0?Math.round(d.bpm) +' BPM':'--';
+    document.getElementById('l-spo2').textContent=d.spo2>0?Math.round(d.spo2)+'%'   :'--';
+    document.getElementById('l-temp').textContent=d.temp>0?d.temp.toFixed(1)  +'C'  :'--';
+    if(d.bpm >0)apt(cB,lbl,d.bpm);
+    if(d.spo2>0)apt(cS,lbl,d.spo2);
+    if(d.temp>0)apt(cT,lbl,d.temp);
+    oB=d.bpm;oS=d.spo2;oT=d.temp;
+    addRow(d.bpm,d.spo2,d.temp,d.ts);
+    document.getElementById('stxt').textContent=now;
+    document.getElementById('ctxt').textContent=rn+' readings';
+    document.getElementById('upd').textContent='Updated: '+now;
+    document.getElementById('ts-last').textContent=fmtTime(d.ts);
+    var ab=document.getElementById('alrt');
+    if(d.bpm>110){ab.style.display='block';ab.textContent='\u26a0 High BPM: '+Math.round(d.bpm)+'!';}
+    else if(d.spo2<95&&d.spo2>0){ab.style.display='block';ab.textContent='\u26a0 Low SpO2: '+Math.round(d.spo2)+'%!';}
+    else if(d.temp>38&&d.temp>0){ab.style.display='block';ab.textContent='\u26a0 High Temp: '+d.temp.toFixed(1)+'C!';}
+    else{ab.style.display='none';}
+  }).catch(function(){
+    document.getElementById('stxt').textContent='Connection lost';
+  });
+}
+loadHist();poll();setInterval(poll,1000);
+</script></body></html>
+)===";
+
+void handleRoot() {
+  String page = FPSTR(HTML_P1);
+  page += FPSTR(HTML_P2);
+  server.send(200, "text/html", page);
+}
+
+// ═════════════════════════════════════════════════════════════
+// Setup
+// ═════════════════════════════════════════════════════════════
+void setup() {
+  Serial.begin(115200);
+  delay(200);
+
+  memset(bpmHistory,  0, sizeof(bpmHistory));
+  memset(spo2History, 0, sizeof(spo2History));
+  memset(tempHistory, 0, sizeof(tempHistory));
+  memset(timeHistory, 0, sizeof(timeHistory));
+
+  Wire.begin(4, 5); // SDA=D2(GPIO4) SCL=D1(GPIO5)
+
+  // ── OLED init ─────────────────────────────────────────────
+  if (!oled.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
+    Serial.println("OLED init FAILED — check wiring!");
+  } else {
+    oled.clearDisplay();
+    oled.setTextColor(WHITE);
+    oled.setTextSize(1);
+    oled.setCursor(0, 10);
+    oled.println("Pulse Oximeter");
+    oled.setCursor(0, 30);
+    oled.println("Starting...");
+    oled.display();
+  }
+
+  // ── MAX30100 raw sensor ───────────────────────────────────
+  sensor.begin();
+  sensor.setMode(MAX30100_MODE_SPO2_HR);
+  sensor.setLedsCurrent(MAX30100_LED_CURR_50MA, MAX30100_LED_CURR_27_1MA);
+  sensor.setLedsPulseWidth(MAX30100_SPC_PW_1600US_16BITS);
+  sensor.setSamplingRate(MAX30100_SAMPRATE_100HZ);
+  sensor.setHighresModeEnabled(true);
+
+  // ── WiFi ──────────────────────────────────────────────────
+  oledSplash("Connecting WiFi", ssid);
+  Serial.print("Connecting to WiFi");
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500); Serial.print(".");
+  }
+  Serial.println("\nWiFi Connected!");
+  String ip = WiFi.localIP().toString();
+  Serial.println("Open: http://" + ip);
+  oledSplash("WiFi OK!", ip);
+  delay(2000);
+
+  // ── PulseOximeter ─────────────────────────────────────────
+  oledSplash("Init MAX30100", "Place finger...");
+  Serial.print("Initializing MAX30100...");
+  if (!pox.begin()) {
+    Serial.println("FAILED!");
+    oledSplash("MAX30100 FAILED", "Check wiring!");
+    while (true);
+  }
+  Serial.println("OK");
+  pox.setIRLedCurrent(MAX30100_LED_CURR_7_6MA);
+  pox.setOnBeatDetectedCallback(onBeatDetected);
+
+  server.on("/",              handleRoot);
+  server.on("/data",          handleData);
+  server.on("/history",       handleHistory);
+  server.on("/manifest.json", handleManifest);
+  server.on("/icon",          handleIcon);
+  server.onNotFound(handle404);
+  server.begin();
+
+  oledSplash("Ready!", "Place finger...");
+  Serial.println("Server ready!");
+}
+
+// ═════════════════════════════════════════════════════════════
+// Loop
+// ═════════════════════════════════════════════════════════════
+void loop() {
+  server.handleClient();
+  pox.update();
+  sensor.update();
+
+  if (millis() - tsLastReading > REPORTING_PERIOD_MS) {
+    sensor.startTemperatureSampling();
+    if (sensor.isTemperatureReady()) TEMP = sensor.retrieveTemperature();
+    tsLastReading = millis();
+  }
+
+  if (millis() - tsLastReport > REPORTING_PERIOD_MS) {
+    BPM  = pox.getHeartRate();
+    SpO2 = pox.getSpO2();
+    Serial.print("BPM:");   Serial.print(BPM);
+    Serial.print(" SpO2:"); Serial.print(SpO2);
+    Serial.print("% Temp:"); Serial.print(TEMP);
+    Serial.println("C");
+    pushHistory(BPM, SpO2, TEMP);
+    tsLastReport = millis();
+  }
+
+  if (millis() - tsLastOLED > OLED_PERIOD_MS) {
+    updateOLED();
+    tsLastOLED = millis();
+  }
+}
